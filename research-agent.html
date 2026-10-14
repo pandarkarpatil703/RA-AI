@@ -749,7 +749,7 @@ body { background: var(--bg); }
       <div class="model-badge">
         <div class="model-dot"></div>
         <div>
-          <div class="model-name">LLaMA 3.3 · 70B Versatile</div>
+          <div class="model-name">GPT-OSS · 120B</div>
           <div class="model-id">Groq Cloud · Ultra-fast inference</div>
         </div>
       </div>
@@ -898,32 +898,38 @@ body { background: var(--bg); }
 
 <div id="toast"></div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+if (window.pdfjsLib) {
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+}
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.9.0/mammoth.browser.min.js"></script>
 <script>
 /* ════════════════════════════════════════════════
    CONFIG — Groq API
 ════════════════════════════════════════════════ */
 const CONFIG = {
-  apiKey:     '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',
-  model:      'llama-3.3-70b-versatile',
+  apiKey:     '', // Entered at runtime; do not hardcode API keys in public HTML
+  model:      'openai/gpt-oss-120b',
   endpoint:   'https://api.groq.com/openai/v1/chat/completions',
   maxTokens:  2048,
   storageKey: 'research_ai_v1'
 };
 
-const SYSTEM_PROMPT = `You are Research AI — an expert academic and scientific research assistant powered by Groq and LLaMA 3.3 70B. You specialize in:
+const SYSTEM_PROMPT = `You are Research AI, a careful academic research assistant.
 
-- Summarizing academic and scientific research papers with precision
-- Generating comprehensive, well-structured literature reviews
-- Identifying research gaps and unexplored areas in any field
-- Recommending relevant citations and references (APA format)
-- Comparing multiple research papers and studies systematically
-- Extracting key findings, contributions, methodologies, and limitations
-- Analyzing data trends, charts, tables, and statistical findings
-- Suggesting emerging research trends and future directions
-- Assisting with paper outlines, abstracts, and research proposals
-- Answering questions grounded in uploaded documents (RAG mode)
-
-Respond with well-structured, accurate, and professional answers. Use bullet points, numbered lists, headers (##), bold for key terms, and code blocks where appropriate. When answering from provided document context, always reference which document the information comes from. Format citations in APA style when requested. Distinguish clearly between established facts and speculative insights.`;
+CORE RULES:
+1. Answer the exact question the user asked. Do not give a generic overview when they ask for a specific fact, comparison, result, or explanation.
+2. Be accurate, direct, and useful. Use clear headings and bullets only when they improve readability. Avoid padding, repeated conclusions, and invented details.
+3. When retrieved document excerpts are provided, treat them as the primary source for questions about those documents. Cite the filename beside the claims it supports.
+4. Never claim that a document says something unless the supplied excerpts support it. If the excerpts are insufficient, say: "I couldn't find enough information about this in the uploaded document excerpts." Then ask whether the user wants a general-knowledge answer, or clearly label any general explanation separately.
+5. Do not invent research papers, authors, DOI numbers, publication dates, statistics, quotations, or citations. If you cannot verify a reference, say so and suggest how to verify it.
+6. For requests for recent papers, latest trends, or current facts, explain that this browser-only app has no live web-search tool. Do not pretend to have searched the internet or know the latest results.
+7. For summaries, preserve the source's actual claims, method, results, limitations, and terminology. Distinguish the paper's findings from your interpretation.
+8. If the question is ambiguous, make a reasonable assumption and state it briefly, or ask one concise clarifying question.
+9. For coding questions, provide code that matches the requested language and explain any important setup requirements.
+10. Keep answers appropriately sized: concise for simple questions and detailed for complex research tasks.`;
 
 /* ════════════════════════════════════════════════
    RAG — In-browser vector store (TF-IDF cosine)
@@ -933,93 +939,117 @@ const ragStore = {
   index: []        // [{docName, chunkIdx, text, tfidf}]
 };
 
+const STOP_WORDS = new Set((
+  'a an the and or but if then than so of in on at to for from by with about as is are was were be been being it its this that these those ' +
+  'i me my we our you your he she they them their what which who whom when where why how can could should would will may might do does did ' +
+  'have has had not no yes into over under between also very more most some any each other such use used using based according describe explain'
+).split(/\s+/));
+
 function tokenize(text) {
-  return text.toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
+  return String(text || '')
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/[^a-z0-9+#.-]/g, ' ')
     .split(/\s+/)
-    .filter(t => t.length > 2);
+    .map(t => t.replace(/^[.-]+|[.-]+$/g, ''))
+    .filter(t => t.length > 2 && !STOP_WORDS.has(t));
 }
 
-function chunkText(text, size = 400, overlap = 80) {
-  const words = text.split(/\s+/);
+function chunkText(text, size = 180, overlap = 35) {
+  const normalized = String(text || '').replace(/\r/g, '').replace(/[ \t]+/g, ' ').trim();
+  if (!normalized) return [];
+  const words = normalized.split(/\s+/);
   const chunks = [];
-  for (let i = 0; i < words.length; i += size - overlap) {
-    const chunk = words.slice(i, i + size).join(' ');
-    if (chunk.trim().length > 40) chunks.push(chunk.trim());
+  const step = Math.max(1, size - overlap);
+  for (let i = 0; i < words.length; i += step) {
+    const chunk = words.slice(i, i + size).join(' ').trim();
+    if (chunk.length > 60) chunks.push(chunk);
+    if (i + size >= words.length) break;
   }
   return chunks;
 }
 
-function buildTFIDF(chunks) {
-  const N = chunks.length;
-  const dfMap = {};
-  const tfMaps = chunks.map(chunk => {
-    const tokens = tokenize(chunk);
-    const tf = {};
-    tokens.forEach(t => { tf[t] = (tf[t] || 0) + 1; });
-    Object.keys(tf).forEach(t => { tf[t] /= tokens.length; });
-    return tf;
-  });
-  tfMaps.forEach(tf => Object.keys(tf).forEach(t => { dfMap[t] = (dfMap[t] || 0) + 1; }));
-  return tfMaps.map(tf => {
-    const tfidf = {};
-    Object.entries(tf).forEach(([t, v]) => {
-      tfidf[t] = v * Math.log((N + 1) / ((dfMap[t] || 0) + 1));
-    });
-    return tfidf;
-  });
-}
-
 function cosineSim(a, b) {
   let dot = 0, normA = 0, normB = 0;
-  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
-  keys.forEach(k => {
-    const av = a[k] || 0, bv = b[k] || 0;
-    dot   += av * bv;
-    normA += av * av;
-    normB += bv * bv;
-  });
+  Object.keys(a).forEach(k => { normA += a[k] * a[k]; });
+  Object.keys(b).forEach(k => { normB += b[k] * b[k]; });
+  Object.keys(a).forEach(k => { if (b[k]) dot += a[k] * b[k]; });
   if (!normA || !normB) return 0;
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-function ragIndex(docName, text) {
-  const chunks = chunkText(text);
-  if (!chunks.length) return 0;
-  const tfidfVecs = buildTFIDF(chunks);
-  chunks.forEach((chunk, i) => {
-    ragStore.index.push({ docName, chunkIdx: i, text: chunk, tfidf: tfidfVecs[i] });
+function makeTFIDF(tokenLists, documentFrequency, totalDocs) {
+  const vectors = [];
+  tokenLists.forEach(tokens => {
+    const tf = {};
+    tokens.forEach(t => { tf[t] = (tf[t] || 0) + 1; });
+    const count = Math.max(tokens.length, 1);
+    const vector = {};
+    Object.entries(tf).forEach(([term, frequency]) => {
+      const idf = Math.log(1 + totalDocs / (1 + (documentFrequency[term] || 0)));
+      vector[term] = (frequency / count) * idf;
+    });
+    vectors.push(vector);
   });
-  // Track doc
-  const existing = ragStore.docs.find(d => d.name === docName);
-  if (!existing) ragStore.docs.push({ name: docName, chunkCount: chunks.length });
-  else existing.chunkCount += chunks.length;
+  return vectors;
+}
+
+function ragIndex(docName, text) {
+  // Replace prior chunks from the same filename to prevent stale/duplicate retrieval.
+  ragStore.index = ragStore.index.filter(entry => entry.docName !== docName);
+  ragStore.docs = ragStore.docs.filter(doc => doc.name !== docName);
+
+  const chunks = chunkText(text);
+  if (!chunks.length) {
+    updateRAGUI();
+    return 0;
+  }
+  chunks.forEach((chunk, i) => {
+    ragStore.index.push({ docName, chunkIdx: i, text: chunk, tfidf: {} });
+  });
+  ragStore.docs.push({ name: docName, chunkCount: chunks.length });
   updateRAGUI();
   return chunks.length;
 }
 
-function ragQuery(query, topK = 4) {
+function ragQuery(query, topK = 6) {
   if (!ragStore.index.length) return [];
-  const qTokens = tokenize(query);
-  const qTF = {};
-  qTokens.forEach(t => { qTF[t] = (qTF[t] || 0) + 1; });
-  Object.keys(qTF).forEach(t => { qTF[t] /= qTokens.length; });
-  const scored = ragStore.index.map(entry => ({
-    ...entry,
-    score: cosineSim(qTF, entry.tfidf)
-  }));
+  const queryTokens = tokenize(query);
+  if (!queryTokens.length) return [];
+
+  // Rebuild IDF over the complete collection, not separately per uploaded file.
+  const allTokenLists = ragStore.index.map(entry => tokenize(entry.text));
+  const df = {};
+  allTokenLists.forEach(tokens => {
+    [...new Set(tokens)].forEach(t => { df[t] = (df[t] || 0) + 1; });
+  });
+  const vectors = makeTFIDF(allTokenLists, df, ragStore.index.length);
+  const qVector = makeTFIDF([queryTokens, ...allTokenLists], df, ragStore.index.length + 1)[0];
+
+  const querySet = new Set(queryTokens);
+  const scored = ragStore.index.map((entry, i) => {
+    const chunkTokens = allTokenLists[i];
+    const chunkSet = new Set(chunkTokens);
+    const overlap = [...querySet].filter(t => chunkSet.has(t)).length;
+    const coverage = overlap / Math.max(querySet.size, 1);
+    const cosine = cosineSim(qVector, vectors[i]);
+    // Favor actual query term coverage, while retaining TF-IDF relevance.
+    const score = 0.75 * cosine + 0.25 * coverage;
+    return { ...entry, score, overlap, coverage };
+  });
   scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, topK).filter(r => r.score > 0.01);
+  // Do not return unrelated passages simply to fill topK.
+  return scored.filter(r => r.overlap > 0 && r.score >= 0.035).slice(0, topK);
 }
 
 function buildRAGContext(query) {
   const results = ragQuery(query);
-  if (!results.length) return null;
+  if (!results.length) return { context: '', sources: [], found: false };
   const sources = [...new Set(results.map(r => r.docName))];
-  const context = results.map(r =>
-    `[Source: ${r.docName}]\n${r.text}`
+  const context = results.map((r, i) =>
+    `[Excerpt ${i + 1} | Source: ${r.docName} | Relevance: ${r.score.toFixed(3)}]\n${r.text}`
   ).join('\n\n---\n\n');
-  return { context, sources };
+  return { context, sources, found: true };
 }
 
 function updateRAGUI() {
@@ -1070,34 +1100,51 @@ const toast       = $('toast');
    GROQ API CALL
 ════════════════════════════════════════════════ */
 async function queryGroq(userMessage, ragCtx) {
+  if (!CONFIG.apiKey) {
+    const enteredKey = window.prompt('Enter your NEW Groq API key. It is held only in this page session.');
+    if (!enteredKey || !enteredKey.trim()) {
+      throw new Error('Groq API key was not provided. Open the chat and try again.');
+    }
+    CONFIG.apiKey = enteredKey.trim();
+  }
+
   const chatMessages = [{ role: 'system', content: SYSTEM_PROMPT }];
 
-  // Inject RAG context as a system note if available
-  if (ragCtx) {
+  if (ragCtx && ragCtx.found) {
     chatMessages.push({
       role: 'system',
-      content: `The user has uploaded documents. Use the following retrieved document excerpts to ground your answer. Always cite the source document name when referencing this content.\n\n${ragCtx.context}`
+      content: `RETRIEVED DOCUMENT EXCERPTS FOLLOW. Use them as evidence for questions about uploaded documents. Cite filenames for claims supported by these excerpts. The excerpts may be incomplete; do not infer missing facts or claim the full document was searched.\n\n${ragCtx.context}`
+    });
+  } else if (ragStore.index.length) {
+    chatMessages.push({
+      role: 'system',
+      content: 'Uploaded documents are indexed, but retrieval found no clearly relevant excerpt for this question. Do not pretend the uploaded documents support your answer. Say that no relevant passage was found, and give a separate general explanation only if useful.'
     });
   }
 
-  // Include last 12 turns of history
-  const history = messages.slice(-24);
-  history.forEach(m => chatMessages.push({ role: m.role, content: m.content }));
+  // messages already includes the current user turn, so exclude it from history
+  // and append the current request exactly once.
+  const history = messages.slice(0, -1).slice(-20);
+  history.forEach(m => {
+    if ((m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string') {
+      chatMessages.push({ role: m.role, content: m.content });
+    }
+  });
   chatMessages.push({ role: 'user', content: userMessage });
 
   const res = await fetch(CONFIG.endpoint, {
     method: 'POST',
     headers: {
-      'Content-Type':  'application/json',
+      'Content-Type': 'application/json',
       'Authorization': `Bearer ${CONFIG.apiKey}`
     },
     body: JSON.stringify({
-      model:       CONFIG.model,
-      messages:    chatMessages,
-      max_tokens:  CONFIG.maxTokens,
-      temperature: 0.7,
-      top_p:       0.9,
-      stream:      false
+      model: CONFIG.model,
+      messages: chatMessages,
+      max_completion_tokens: CONFIG.maxTokens,
+      temperature: 0.25,
+      top_p: 0.9,
+      stream: false
     })
   });
 
@@ -1107,12 +1154,16 @@ async function queryGroq(userMessage, ragCtx) {
     try {
       const j = JSON.parse(errText);
       errMsg += ': ' + (j.error?.message || errText);
-    } catch {}
+    } catch {
+      errMsg += ': ' + errText;
+    }
     throw new Error(errMsg);
   }
 
   const data = await res.json();
-  return (data.choices?.[0]?.message?.content || 'No response received.').trim();
+  const content = data.choices?.[0]?.message?.content;
+  if (!content || !content.trim()) throw new Error('Groq returned an empty response. Try again or shorten your question.');
+  return content.trim();
 }
 
 /* ════════════════════════════════════════════════
@@ -1289,20 +1340,9 @@ async function sendMessage(text) {
   setTyping(true);
 
   try {
-    // Build composite query with file content for non-RAG inline context
-    let queryText = text;
-    let inlineCtx = '';
-    if (filesToSend.length) {
-      inlineCtx = filesToSend
-        .filter(f => f.content)
-        .map(f => `[Attached: ${f.name}]\n${f.content}`)
-        .join('\n\n');
-      if (inlineCtx) queryText = `${text}\n\n--- Attached Document Content ---\n${inlineCtx}`;
-    }
-
-    // RAG retrieval
+    // Retrieve only relevant excerpts instead of sending the entire file blindly.
     const ragResult = ragStore.index.length ? buildRAGContext(text) : null;
-
+    const queryText = text;
     const reply = await queryGroq(queryText, ragResult);
     messages.push({ role: 'assistant', content: reply });
     setTyping(false);
@@ -1322,26 +1362,58 @@ async function sendMessage(text) {
 /* ════════════════════════════════════════════════
    FILE HANDLING + RAG INDEXING
 ════════════════════════════════════════════════ */
-function handleFiles(fileList) {
-  Array.from(fileList).forEach(file => {
-    const reader = new FileReader();
-    const isText = file.type.startsWith('text/') || /\.(txt|md|csv|json|py|js|ts|html|xml)$/i.test(file.name);
+async function extractFileText(file) {
+  const name = file.name.toLowerCase();
+  const isPlainText = file.type.startsWith('text/') ||
+    /\.(txt|md|csv|json|py|js|ts|html|xml|css|java|c|cpp|h|sql|log)$/i.test(name);
 
-    reader.onload = e => {
-      const content = isText ? e.target.result : null;
+  if (isPlainText) return await file.text();
+
+  if (name.endsWith('.pdf')) {
+    if (!window.pdfjsLib) throw new Error('PDF reader library did not load. Check your internet connection and reload the page.');
+    const buffer = await file.arrayBuffer();
+    const pdf = await window.pdfjsLib.getDocument({ data: buffer }).promise;
+    const pages = [];
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const content = await page.getTextContent();
+      pages.push(content.items.map(item => item.str).join(' '));
+    }
+    return pages.join('\n\n');
+  }
+
+  if (name.endsWith('.docx')) {
+    if (!window.mammoth) throw new Error('DOCX reader library did not load. Check your internet connection and reload the page.');
+    const result = await window.mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+    return result.value || '';
+  }
+
+  if (name.endsWith('.doc')) {
+    throw new Error('Legacy .doc files are not supported. Save this file as .docx or PDF and upload it again.');
+  }
+
+  throw new Error('This file type cannot be read. Upload a text file, PDF, DOCX, CSV, or Markdown file.');
+}
+
+async function handleFiles(fileList) {
+  for (const file of Array.from(fileList)) {
+    try {
+      showToast(`Reading "${file.name}"…`, 'info');
+      const content = await extractFileText(file);
+      if (!content || !content.trim()) {
+        showToast(`No selectable text found in "${file.name}". Scanned PDFs need OCR first.`, 'error');
+        continue;
+      }
+
+      attachedFiles = attachedFiles.filter(f => f.name !== file.name);
       attachedFiles.push({ name: file.name, size: file.size, type: file.type, content });
       addChip(file.name, file.size);
-
-      // Index into RAG if text-readable
-      if (content) {
-        const chunks = ragIndex(file.name, content);
-        showToast(`Indexed "${file.name}" → ${chunks} chunks`, 'success');
-      }
-    };
-
-    if (isText) reader.readAsText(file);
-    else reader.readAsArrayBuffer(file);
-  });
+      const chunks = ragIndex(file.name, content);
+      showToast(`Indexed "${file.name}" → ${chunks} searchable chunks`, 'success');
+    } catch (err) {
+      showToast(err.message || `Could not read "${file.name}".`, 'error');
+    }
+  }
 }
 
 function addChip(name, size) {
